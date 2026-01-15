@@ -64,8 +64,12 @@ add_cpp_test(link_test)
 add_cpp_test(credit_test)
 add_cpp_test(delivery_test)
 add_cpp_test(context_test)
+
+# Transaction tests
 add_cpp_test(transaction_test)
 target_link_libraries(transaction_test qpid-proton-core)
+add_cpp_test(transaction_test_enhanced)
+target_link_libraries(transaction_test_enhanced qpid-proton-core)
 
 if (ENABLE_JSONCPP)
   add_cpp_test(connect_config_test)

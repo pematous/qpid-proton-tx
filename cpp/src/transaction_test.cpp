@@ -274,7 +274,7 @@ void test_transaction_abort(FakeBroker &broker, test_client &client) {
    client.block_declare_transaction_on_session.set_value();
 
    wait_for_promise_or_fail(broker.declare_promise, "declare in broker");
-   wait_for_promise_or_fail(broker.commit_promise, "commit in broker");
+   wait_for_promise_or_fail(broker.abort_promise, "abort in broker");
 
    // Only zero transactions
    ASSERT_EQUAL(broker.transactions_messages.size(), 0u);
@@ -283,27 +283,61 @@ void test_transaction_abort(FakeBroker &broker, test_client &client) {
 int main(int argc, char** argv) {
    int tests_failed = 0;
 
-   std::string broker_address("127.0.0.1:0");
-   FakeBroker broker(broker_address);
+   // Test 1: Transaction Commit
+   {
+       std::cout << "\n=== Running Test 1: Transaction Commit ===" << std::endl;
+       listener_ready = false;  // Reset for new test
+       
+       std::string broker_address("127.0.0.1:0");
+       FakeBroker broker(broker_address);
 
-   proton::container broker_container(broker);
-   std::thread broker_thread([&broker_container]() -> void { broker_container.run(); });
+       proton::container broker_container(broker);
+       std::thread broker_thread([&broker_container]() -> void { broker_container.run(); });
 
-   // Wait for the listener
-   std::unique_lock<std::mutex> lk(m);
-   cv.wait(lk, [] { return listener_ready; });
+       // Wait for the listener
+       std::unique_lock<std::mutex> lk(m);
+       cv.wait(lk, [] { return listener_ready; });
+       lk.unlock();
 
+       std::string server_address = "127.0.0.1:" + std::to_string(listener_port);
+       test_client client(server_address);
 
-   std::string server_address = "127.0.0.1:" + std::to_string(listener_port);
-   test_client client(server_address);
+       proton::container client_container(client);
+       std::thread client_thread([&client_container]() -> void { client_container.run(); });
 
-   proton::container client_container(client);
-   std::thread client_thread([&client_container]() -> void { client_container.run(); });
+       RUN_ARGV_TEST(tests_failed, test_transaction_commit(broker, client));
 
-   RUN_ARGV_TEST(tests_failed, test_transaction_commit(broker, client));
+       broker_thread.join();
+       client_thread.join();
+   }
 
-   broker_thread.join();
-   client_thread.join();
+   // Test 2: Transaction Abort
+   {
+       std::cout << "\n=== Running Test 2: Transaction Abort ===" << std::endl;
+       listener_ready = false;  // Reset for new test
+       
+       std::string broker_address("127.0.0.1:0");
+       FakeBroker broker(broker_address);
+
+       proton::container broker_container(broker);
+       std::thread broker_thread([&broker_container]() -> void { broker_container.run(); });
+
+       // Wait for the listener
+       std::unique_lock<std::mutex> lk(m);
+       cv.wait(lk, [] { return listener_ready; });
+       lk.unlock();
+
+       std::string server_address = "127.0.0.1:" + std::to_string(listener_port);
+       test_client client(server_address);
+
+       proton::container client_container(client);
+       std::thread client_thread([&client_container]() -> void { client_container.run(); });
+
+       RUN_ARGV_TEST(tests_failed, test_transaction_abort(broker, client));
+
+       broker_thread.join();
+       client_thread.join();
+   }
 
    return tests_failed;
 }
