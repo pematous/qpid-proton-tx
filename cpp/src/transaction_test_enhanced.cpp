@@ -251,6 +251,7 @@ class BasicTransactionClient : public proton::messaging_handler {
    int messages_to_send_;
    bool should_commit_;
    bool transaction_started_ = false;
+   bool discharge_called_ = false;
 
  public:
    proton::sender sender_;
@@ -297,7 +298,8 @@ class BasicTransactionClient : public proton::messaging_handler {
            std::cout << "[CLIENT] Sent message " << messages_sent << "/" << messages_to_send_ << std::endl;
        }
 
-       if (messages_sent == messages_to_send_) {
+       if (messages_sent == messages_to_send_ && !discharge_called_) {
+           discharge_called_ = true;
            if (should_commit_) {
                std::cout << "[CLIENT] Committing transaction" << std::endl;
                session.transaction_commit();
