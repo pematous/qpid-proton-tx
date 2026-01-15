@@ -183,8 +183,17 @@ proton::tracker transaction_send_ctrl(sender&& coordinator, const symbol& descri
 
 void transaction_discharge(const session& s, bool failed) {
     auto& transaction_context = get_transaction_context(s);
-    if (transaction_is_empty(s) || transaction_context->state != transaction_context::State::DECLARED)
+    if (transaction_is_empty(s))
+        throw proton::error("No transaction to discharge.");
+
+    // If already discharging, silently ignore (idempotent operation)
+    if (transaction_context->state == transaction_context::State::DISCHARGING)
+        return;
+
+    // Only allow discharge from DECLARED state
+    if (transaction_context->state != transaction_context::State::DECLARED)
         throw proton::error("Only a declared txn can be discharged.");
+
     transaction_context->state = transaction_context::State::DISCHARGING;
 
     transaction_context->failed = failed;
