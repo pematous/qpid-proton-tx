@@ -42,6 +42,7 @@
 #include <proton/messaging_handler.hpp>
 #include <proton/receiver.hpp>
 #include <proton/sender.hpp>
+#include <proton/transport.hpp>
 #include <proton/session.hpp>
 #include <proton/types.hpp>
 #include "proton_bits.hpp"
@@ -121,6 +122,33 @@ class EnhancedFakeBroker : public proton::messaging_handler {
    void set_reject_declare(bool reject) { should_reject_declare = reject; }
    void set_fail_commit(bool fail) { should_fail_commit = fail; }
    void set_auto_close(bool close) { auto_close_on_discharge = close; }
+   
+   // Helper method to reset all promises for a new test
+   void reset_promises() {
+       declare_promises.clear();
+       commit_promises.clear();
+       abort_promises.clear();
+   }
+   
+   // Helper method to prepare promises for a test that needs declare and commit
+   void prepare_for_commit_test() {
+       reset_promises();
+       declare_promises.emplace_back();
+       commit_promises.emplace_back();
+   }
+   
+   // Helper method to prepare promises for a test that needs declare and abort
+   void prepare_for_abort_test() {
+       reset_promises();
+       declare_promises.emplace_back();
+       abort_promises.emplace_back();
+   }
+   
+   // Helper method to prepare promises for a test that only needs declare
+   void prepare_for_declare_test() {
+       reset_promises();
+       declare_promises.emplace_back();
+   }
 
    void on_container_start(proton::container& c) override {
        listener = c.listen(url, listen_handler);
@@ -152,6 +180,16 @@ class EnhancedFakeBroker : public proton::messaging_handler {
            proton::binary txn_id = proton::bin(pn_transactional_disposition_get_id(disp));
            transactions_messages[txn_id].push_back(m);
            std::cout << "[BROKER] Received transactional message in txn: " << txn_id << std::endl;
+           
+           // Send back a transactional disposition (accept) to the sender
+           pn_delivery_t* pd = proton::unwrap(d);
+           pn_disposition_t* local_disp = pn_delivery_local(pd);
+           pn_transactional_disposition_t* txn_disp = pn_transactional_disposition(local_disp);
+           pn_transactional_disposition_set_id(txn_disp, pn_bytes(txn_id));
+           pn_transactional_disposition_set_outcome_type(txn_disp, PN_ACCEPTED);
+           pn_delivery_update(pd, PN_TRANSACTIONAL_STATE);  // Update the delivery state
+           pn_delivery_settle(pd);
+           std::cout << "[BROKER] Sent transactional accept for message in txn: " << txn_id << std::endl;
        }
    }
 
@@ -257,6 +295,7 @@ class BasicTransactionClient : public proton::messaging_handler {
    proton::sender sender_;
    std::promise<void> ready_promise;
    std::promise<void> finished_promise;
+   std::promise<void> txn_id_captured_promise;
    proton::binary last_txn_id;
    int messages_sent = 0;
 
@@ -280,6 +319,7 @@ class BasicTransactionClient : public proton::messaging_handler {
        last_txn_id = s.transaction_id();
        std::cout << "[CLIENT] Transaction declared: " << last_txn_id << std::endl;
        transaction_started_ = true;
+       txn_id_captured_promise.set_value();
        send_messages();
    }
 
@@ -290,42 +330,68 @@ class BasicTransactionClient : public proton::messaging_handler {
    }
 
    void send_messages() {
-       proton::session session = sender_.session();
-       while (session.transaction_is_declared() && sender_.credit() && messages_sent < messages_to_send_) {
-           proton::message msg("test message " + std::to_string(messages_sent));
-           sender_.send(msg);
-           messages_sent++;
-           std::cout << "[CLIENT] Sent message " << messages_sent << "/" << messages_to_send_ << std::endl;
-       }
-
-       if (messages_sent == messages_to_send_ && !discharge_called_) {
-           discharge_called_ = true;
-           if (should_commit_) {
-               std::cout << "[CLIENT] Committing transaction" << std::endl;
-               session.transaction_commit();
-           } else {
-               std::cout << "[CLIENT] Aborting transaction" << std::endl;
-               session.transaction_abort();
+       try {
+           proton::session session = sender_.session();
+           std::cout << "[CLIENT DEBUG] send_messages called, messages_sent=" << messages_sent
+                     << ", discharge_called=" << discharge_called_ << std::endl;
+           
+           while (session.transaction_is_declared() && sender_.credit() && messages_sent < messages_to_send_) {
+               proton::message msg("test message " + std::to_string(messages_sent));
+               sender_.send(msg);
+               messages_sent++;
+               std::cout << "[CLIENT] Sent message " << messages_sent << "/" << messages_to_send_ << std::endl;
            }
+
+           if (messages_sent == messages_to_send_ && !discharge_called_) {
+               discharge_called_ = true;
+               if (should_commit_) {
+                   std::cout << "[CLIENT] Committing transaction" << std::endl;
+                   session.transaction_commit();
+               } else {
+                   std::cout << "[CLIENT] Aborting transaction" << std::endl;
+                   session.transaction_abort();
+               }
+           } else if (messages_sent == messages_to_send_) {
+               std::cout << "[CLIENT DEBUG] Skipping discharge (already called)" << std::endl;
+           }
+       } catch (const std::exception& e) {
+           std::cerr << "[CLIENT ERROR] Exception in send_messages: " << e.what() << std::endl;
+           throw;
        }
    }
 
    void on_session_transaction_committed(proton::session& s) override {
-       std::cout << "[CLIENT] Transaction committed successfully" << std::endl;
-       finished_promise.set_value();
-       s.connection().close();
+       try {
+           std::cout << "[CLIENT] Transaction committed successfully" << std::endl;
+           finished_promise.set_value();
+           s.connection().close();
+       } catch (const std::exception& e) {
+           std::cerr << "[CLIENT ERROR] Exception in on_session_transaction_committed: " << e.what() << std::endl;
+       }
    }
 
    void on_session_transaction_aborted(proton::session& s) override {
-       std::cout << "[CLIENT] Transaction aborted successfully" << std::endl;
-       finished_promise.set_value();
-       s.connection().close();
+       try {
+           std::cout << "[CLIENT] Transaction aborted successfully" << std::endl;
+           finished_promise.set_value();
+           s.connection().close();
+       } catch (const std::exception& e) {
+           std::cerr << "[CLIENT ERROR] Exception in on_session_transaction_aborted: " << e.what() << std::endl;
+       }
    }
 
    void on_session_transaction_error(proton::session& s) override {
-       std::cout << "[CLIENT] Transaction error: " << s.transaction_error().what() << std::endl;
-       finished_promise.set_value();
-       s.connection().close();
+       try {
+           std::cout << "[CLIENT] Transaction error: " << s.transaction_error().what() << std::endl;
+           finished_promise.set_value();
+           s.connection().close();
+       } catch (const std::exception& e) {
+           std::cerr << "[CLIENT ERROR] Exception in on_session_transaction_error: " << e.what() << std::endl;
+       }
+   }
+   
+   void on_transport_error(proton::transport& t) override {
+       std::cerr << "[CLIENT ERROR] Transport error: " << t.error().what() << std::endl;
    }
 };
 
@@ -522,7 +588,9 @@ void test_basic_abort(EnhancedFakeBroker& broker) {
     
     broker.declare_count = 0;
     broker.abort_count = 0;
+    broker.commit_count = 0;
     broker.transactions_messages.clear();
+    broker.prepare_for_abort_test();
     
     std::string server_address = "127.0.0.1:" + std::to_string(listener_port);
     BasicTransactionClient client(server_address, 3, false);
@@ -550,6 +618,8 @@ void test_transaction_id_retrieval() {
     std::string broker_address("127.0.0.1:0");
     EnhancedFakeBroker broker(broker_address);
     broker.set_auto_close(true);
+    // Clear and recreate promises for this test
+    broker.prepare_for_commit_test();
     
     proton::container broker_container(broker);
     std::thread broker_thread([&broker_container]() { broker_container.run(); });
@@ -564,15 +634,23 @@ void test_transaction_id_retrieval() {
     proton::container client_container(client);
     std::thread client_thread([&client_container]() { client_container.run(); });
     
-    client.ready_promise.set_value();
-    wait_for_promise_or_fail(broker.declare_promises[0], "declare");
-    
-    // Verify transaction ID was captured
-    ASSERT(!client.last_txn_id.empty());
-    ASSERT_EQUAL(client.last_txn_id, fake_txn_id);
-    
-    wait_for_promise_or_fail(broker.commit_promises[0], "commit");
-    wait_for_promise_or_fail(client.finished_promise, "client finished");
+    try {
+        client.ready_promise.set_value();
+        wait_for_promise_or_fail(broker.declare_promises[0], "broker declare");
+        wait_for_promise_or_fail(client.txn_id_captured_promise, "client txn id captured");
+        
+        // Verify transaction ID was captured
+        ASSERT(!client.last_txn_id.empty());
+        ASSERT_EQUAL(client.last_txn_id, fake_txn_id);
+        
+        wait_for_promise_or_fail(broker.commit_promises[0], "commit");
+        wait_for_promise_or_fail(client.finished_promise, "client finished");
+    } catch (...) {
+        // Ensure threads are joined even on failure
+        if (broker_thread.joinable()) broker_thread.join();
+        if (client_thread.joinable()) client_thread.join();
+        throw;
+    }
     
     broker_thread.join();
     client_thread.join();
@@ -585,6 +663,12 @@ void test_multiple_sequential_transactions() {
     
     std::string broker_address("127.0.0.1:0");
     EnhancedFakeBroker broker(broker_address);
+    // Clear and recreate promises for 2 transactions
+    broker.reset_promises();
+    broker.declare_promises.emplace_back();
+    broker.declare_promises.emplace_back();
+    broker.commit_promises.emplace_back();
+    broker.commit_promises.emplace_back();
     broker.set_auto_close(false);
     
     proton::container broker_container(broker);
@@ -600,25 +684,33 @@ void test_multiple_sequential_transactions() {
     proton::container client_container(client);
     std::thread client_thread([&client_container]() { client_container.run(); });
     
-    client.ready_promise.set_value();
-    
-    // Wait for first transaction
-    wait_for_promise_or_fail(broker.declare_promises[0], "first declare");
-    wait_for_promise_or_fail(broker.commit_promises[0], "first commit");
-    
-    // Wait for second transaction
-    wait_for_promise_or_fail(broker.declare_promises[1], "second declare");
-    wait_for_promise_or_fail(broker.commit_promises[1], "second commit");
-    
-    wait_for_promise_or_fail(client.finished_promise, "client finished");
+    try {
+        client.ready_promise.set_value();
+        
+        // Wait for first transaction
+        wait_for_promise_or_fail(broker.declare_promises[0], "first declare");
+        wait_for_promise_or_fail(broker.commit_promises[0], "first commit");
+        
+        // Wait for second transaction
+        wait_for_promise_or_fail(broker.declare_promises[1], "second declare");
+        wait_for_promise_or_fail(broker.commit_promises[1], "second commit");
+        
+        wait_for_promise_or_fail(client.finished_promise, "client finished");
+        
+        ASSERT_EQUAL(client.transaction_ids.size(), 2u);
+        ASSERT_EQUAL(broker.declare_count.load(), 2);
+        ASSERT_EQUAL(broker.commit_count.load(), 2);
+    } catch (...) {
+        // Ensure threads are joined even on failure
+        broker.listener.stop();
+        if (broker_thread.joinable()) broker_thread.join();
+        if (client_thread.joinable()) client_thread.join();
+        throw;
+    }
     
     broker.listener.stop();
     broker_thread.join();
     client_thread.join();
-    
-    ASSERT_EQUAL(client.transaction_ids.size(), 2u);
-    ASSERT_EQUAL(broker.declare_count.load(), 2);
-    ASSERT_EQUAL(broker.commit_count.load(), 2);
     
     std::cout << "✓ Multiple sequential transactions test passed" << std::endl;
 }
@@ -628,6 +720,8 @@ void test_double_declare_error() {
     
     std::string broker_address("127.0.0.1:0");
     EnhancedFakeBroker broker(broker_address);
+    // Clear and recreate promises to avoid reuse from previous tests
+    broker.prepare_for_commit_test();
     
     proton::container broker_container(broker);
     std::thread broker_thread([&broker_container]() { broker_container.run(); });
@@ -662,6 +756,8 @@ class TransactionalDeliveryClient : public proton::messaging_handler {
    std::string server_address_;
    int messages_to_send_;
    std::string disposition_type_; // "accept", "reject", or "release"
+   int messages_sent_ = 0;
+   int dispositions_received_ = 0;
 
  public:
    proton::sender sender_;
@@ -698,36 +794,44 @@ class TransactionalDeliveryClient : public proton::messaging_handler {
 
    void send_messages() {
        proton::session session = sender_.session();
-       static int sent = 0;
-       while (session.transaction_is_declared() && sender_.credit() && sent < messages_to_send_) {
-           proton::message msg("delivery test message " + std::to_string(sent));
+       while (session.transaction_is_declared() && sender_.credit() && messages_sent_ < messages_to_send_) {
+           proton::message msg("delivery test message " + std::to_string(messages_sent_));
            sender_.send(msg);
-           sent++;
-           std::cout << "[CLIENT] Sent message " << sent << std::endl;
+           messages_sent_++;
+           std::cout << "[CLIENT] Sent message " << messages_sent_ << std::endl;
        }
+   }
 
-       if (sent == messages_to_send_) {
-           std::cout << "[CLIENT] All messages sent, committing transaction" << std::endl;
+   void check_and_commit() {
+       if (messages_sent_ == messages_to_send_ && dispositions_received_ == messages_to_send_) {
+           std::cout << "[CLIENT] All messages sent and dispositions received, committing transaction" << std::endl;
+           proton::session session = sender_.session();
            session.transaction_commit();
        }
    }
 
    void on_transactional_accept(proton::tracker& t) override {
        transactional_accept_count++;
-       std::cout << "[CLIENT] Transactional accept received (count: " 
+       dispositions_received_++;
+       std::cout << "[CLIENT] Transactional accept received (count: "
                  << transactional_accept_count << ")" << std::endl;
+       check_and_commit();
    }
 
    void on_transactional_reject(proton::tracker& t) override {
        transactional_reject_count++;
-       std::cout << "[CLIENT] Transactional reject received (count: " 
+       dispositions_received_++;
+       std::cout << "[CLIENT] Transactional reject received (count: "
                  << transactional_reject_count << ")" << std::endl;
+       check_and_commit();
    }
 
    void on_transactional_release(proton::tracker& t) override {
        transactional_release_count++;
-       std::cout << "[CLIENT] Transactional release received (count: " 
+       dispositions_received_++;
+       std::cout << "[CLIENT] Transactional release received (count: "
                  << transactional_release_count << ")" << std::endl;
+       check_and_commit();
    }
 
    void on_session_transaction_committed(proton::session& s) override {
@@ -745,6 +849,7 @@ class SettleBeforeDischargeClient : public proton::messaging_handler {
    std::string server_address_;
    bool settle_before_discharge_;
    int messages_to_send_;
+   int messages_sent_ = 0;
 
  public:
    proton::sender sender_;
@@ -782,14 +887,13 @@ class SettleBeforeDischargeClient : public proton::messaging_handler {
 
    void send_messages() {
        proton::session session = sender_.session();
-       static int sent = 0;
-       while (session.transaction_is_declared() && sender_.credit() && sent < messages_to_send_) {
-           proton::message msg("settle test message " + std::to_string(sent));
+       while (session.transaction_is_declared() && sender_.credit() && messages_sent_ < messages_to_send_) {
+           proton::message msg("settle test message " + std::to_string(messages_sent_));
            sender_.send(msg);
-           sent++;
+           messages_sent_++;
        }
 
-       if (sent == messages_to_send_) {
+       if (messages_sent_ == messages_to_send_) {
            std::cout << "[CLIENT] Committing transaction" << std::endl;
            session.transaction_commit();
        }
@@ -818,6 +922,8 @@ void test_transactional_accept() {
     
     std::string broker_address("127.0.0.1:0");
     EnhancedFakeBroker broker(broker_address);
+    // Clear and recreate promises to avoid reuse from previous tests
+    broker.prepare_for_commit_test();
     broker.set_auto_close(true);
     
     proton::container broker_container(broker);
@@ -852,6 +958,8 @@ void test_settle_before_discharge_true() {
     
     std::string broker_address("127.0.0.1:0");
     EnhancedFakeBroker broker(broker_address);
+    // Clear and recreate promises to avoid reuse from previous tests
+    broker.prepare_for_commit_test();
     broker.set_auto_close(true);
     
     proton::container broker_container(broker);
@@ -885,6 +993,9 @@ void test_settle_before_discharge_false() {
     
     std::string broker_address("127.0.0.1:0");
     EnhancedFakeBroker broker(broker_address);
+    // Clear and recreate promises to avoid reuse from previous tests
+    broker.prepare_for_declare_test();
+    broker.commit_promises.emplace_back();
     broker.set_auto_close(true);
     
     proton::container broker_container(broker);
@@ -918,6 +1029,7 @@ void test_commit_without_declare_error() {
     
     std::string broker_address("127.0.0.1:0");
     EnhancedFakeBroker broker(broker_address);
+    broker.prepare_for_declare_test();
     
     proton::container broker_container(broker);
     std::thread broker_thread([&broker_container]() { broker_container.run(); });
@@ -949,6 +1061,8 @@ void test_abort_without_declare_error() {
     
     std::string broker_address("127.0.0.1:0");
     EnhancedFakeBroker broker(broker_address);
+    // Clear and recreate promises to avoid reuse from previous tests
+    broker.prepare_for_abort_test();
     
     proton::container broker_container(broker);
     std::thread broker_thread([&broker_container]() { broker_container.run(); });
@@ -989,6 +1103,9 @@ int main(int argc, char** argv) {
    // Start broker for basic tests
    std::string broker_address("127.0.0.1:0");
    EnhancedFakeBroker broker(broker_address);
+   // Clear and recreate promises to avoid reuse from previous tests
+   broker.prepare_for_commit_test();
+   broker.abort_promises.emplace_back();
    broker.set_auto_close(false);
 
    proton::container broker_container(broker);
